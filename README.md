@@ -1,6 +1,5 @@
 ### Secp256k1 CUDA Implementation
-This repository provides a CUDA-based high-performance implementation of elliptic curve cryptography (ECC) operations using the SECP256k1 curve, which is widely used in blockchain technologies such as Bitcoin.
-The implementation is optimized for batch processing and uses low-level GPU operations to accelerate elliptic curve point multiplication and modulo operations.
+This repository provides a high-performance CUDA-based implementation of Elliptic Curve Cryptography (ECC) operations. It is a small library, please do not compare it with large libraries. It uses the SECP256k1 curve, which is widely used in blockchain technologies such as Bitcoin.
 
 ### Overview
 
