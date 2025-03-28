@@ -1,10 +1,8 @@
-###Secp256k1 CUDA Implementation
-This repository provides a high-performance CUDA-based implementation of elliptic curve cryptography (ECC) operations using 
-the SECP256k1 curve, which is widely used in blockchain technologies, such as Bitcoin. 
-The implementation is optimized for batch processing and uses low-level GPU operations to accelerate 
-elliptic curve point multiplication and modular arithmetic.
+### Secp256k1 CUDA Implementation
+This repository provides a CUDA-based high-performance implementation of elliptic curve cryptography (ECC) operations using the SECP256k1 curve, which is widely used in blockchain technologies such as Bitcoin.
+The implementation is optimized for batch processing and uses low-level GPU operations to accelerate elliptic curve point multiplication and modulo operations.
 
-###Overview
+### Overview
 
 The implementation covers the following key components:
 Big Integer (BigInt): Supports multi-precision arithmetic for 256-bit integers, which are the foundation for ECC operations.
@@ -16,21 +14,21 @@ Montgomery Ladder: Implements a batch-optimized scalar multiplication using the 
 
 CUDA Kernels: The core of the implementation is designed for GPU acceleration, using custom CUDA kernels to perform elliptic curve operations in parallel across multiple keys.
 
-###Key Features
+### Key Features
 `
 Elliptic Curve Arithmetic: Supports addition, doubling, and scalar multiplication of elliptic curve points over the SECP256k1 field.
 Modular Arithmetic: Optimized modular operations, including multiplication and inverse, that respect the SECP256k1 curve's modulus (p = 2^256 - 2^32 - 977).
 CUDA Optimization: The code is optimized for CUDA to utilize the power of GPUs for batch scalar multiplications.
 Efficient Memory Usage: The implementation leverages constant memory and shared memory to minimize latency and maximize throughput on supported NVIDIA GPUs.
 
-###Requirements
+### Requirements
 ```sh
 CUDA-enabled GPU
 CUDA Toolkit 11.x or later
 NVIDIA Driver 450.x or later
 C++11 or later compiler
 ```
-###File Structure
+### File Structure
 secp256k1.cuh: Contains the core header file with the definitions of the elliptic curve point structure, big integer operations, and CUDA kernel functions.
 kernel_montgomery_ladder_batch_optimized: The kernel for performing batch scalar multiplication using the Montgomery ladder.
 
@@ -38,7 +36,7 @@ Helper Functions: Includes functions for multi-precision integer operations
  (addition, subtraction, multiplication), modular arithmetic, and ECC point operations.
 
 
-###Compilation
+### Compilation
 To compile this code, you need a CUDA development environment set up. Run the following command:
 
 ```sh
@@ -49,7 +47,7 @@ Once compiled, you can use the code to perform elliptic curve operations on the 
 
 The kernel_montgomery_ladder_batch_optimized kernel performs scalar multiplication using the Montgomery ladder algorithm.
 
-###Functionality
+### Functionality
 point_add: Adds two elliptic curve points.
 double_point: Doubles an elliptic curve point.
 modexp: Computes modular exponentiation.
@@ -74,7 +72,7 @@ Contributions are welcome! Please open an issue or submit a pull request for bug
 
 Ensure all contributions adhere to the style and performance requirements of the repository.
 ```
-###Sponsorship
+### Sponsorship
 If this project has been helpful to you, please consider sponsoring. 
 
 Your support is greatly appreciated. Thank you!
@@ -84,6 +82,6 @@ Your support is greatly appreciated. Thank you!
 -DOGE: DTszb9cPALbG9ESNJMFJt4ECqWGRCgucky
 -TRX: TAHUmjyzg7B3Nndv264zWYUhQ9HUmX4Xu4
 ```
-###License
+### License
 This project is licensed under the MIT License - see the LICENSE file for details.
 
