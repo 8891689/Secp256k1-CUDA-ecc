@@ -1,394 +1,428 @@
-/*Author: 8891689/ChatGPT */
-
+// Author: 8891689
 #ifndef SECP256K1_CUH
 #define SECP256K1_CUH
 
-#include <cstdio>
-#include <cstring>
-#include <stdint.h>
 #include <cuda_runtime.h>
+#include <stdint.h>
+#include <string.h>
 
-//=============================================================================
-// 1. 数据结构定义
-//=============================================================================
+#define BIGINT_WORDS 8
 
-// 256位大整数（8个32位无符号整数，小端存储，即 data[0] 为最低位）
+// CUDA 错误检查宏
+#define CHECK_CUDA(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
+
+// ============================================================================
+// 1. 数据结构 (与 C 版本相同, 可在 Host 和 Device 间传递)
+// ============================================================================
 struct BigInt {
-    uint32_t data[8];
+    uint32_t data[BIGINT_WORDS];
 };
 
-// ECC 点（仿射坐标）
 struct ECPoint {
-    BigInt x;
-    BigInt y;
-    bool infinity;  // true 表示无穷远点
+    BigInt x, y;
+    bool infinity;
 };
 
-//=============================================================================
-// 2. __constant__ 内存：存放 SECP256k1 的模数 p = 2^256 - 2^32 - 977
-//=============================================================================
+struct ECPointJac {
+    BigInt X, Y, Z;
+    bool infinity;
+};
+
+// ============================================================================
+// 常量参数 (在 GPU 的 __constant__ 内存中)
+// ============================================================================
 __constant__ BigInt const_p;
+__constant__ ECPointJac const_G_jacobian;
+__constant__ BigInt const_n;
 
-//=============================================================================
-// 3. 辅助函数：多精度运算及模运算函数
-//=============================================================================
 
-// 初始化：将 BigInt 清零，并设置第 0 个字为 val
-__host__ __device__ __forceinline__ void init_bigint(BigInt &x, uint32_t val) {
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        x.data[i] = 0;
-    }
-    x.data[0] = val;
+// ============================================================================
+// 3. 移植的 C 函数 (添加 __host__ __device__ __forceinline__ 等限定符)
+// ============================================================================
+
+// --- BigInt 基本运算 ---
+__host__ __device__ __forceinline__ void init_bigint(BigInt *x, uint32_t val) {
+    x->data[0] = val;
+    for (int i = 1; i < BIGINT_WORDS; i++) x->data[i] = 0;
 }
 
-// 内联复制
-__host__ __device__ __forceinline__ void copy_bigint(BigInt &dest, const BigInt &src) {
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        dest.data[i] = src.data[i];
+__host__ __device__ __forceinline__ void copy_bigint(BigInt *dest, const BigInt *src) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        dest->data[i] = src->data[i];
     }
 }
 
-// 内联比较：返回 1 表示 a > b，-1 表示 a < b，0 表示相等
-__host__ __device__ __forceinline__ int compare_bigint(const BigInt &a, const BigInt &b) {
-    for (int i = 7; i >= 0; i--) {
-        if (a.data[i] > b.data[i])
-            return 1;
-        else if (a.data[i] < b.data[i])
-            return -1;
+__host__ __device__ __forceinline__ int compare_bigint(const BigInt *a, const BigInt *b) {
+    for (int i = BIGINT_WORDS - 1; i >= 0; i--) {
+        if (a->data[i] > b->data[i]) return 1;
+        if (a->data[i] < b->data[i]) return -1;
     }
     return 0;
 }
 
-// 判断是否为 0
-__host__ __device__ __forceinline__ bool is_zero(const BigInt &a) {
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        if (a.data[i] != 0)
-            return false;
+__host__ __device__ __forceinline__ bool is_zero(const BigInt *a) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        if (a->data[i]) return false;
     }
     return true;
 }
 
-// 内联取位（从低位开始计数）
-__host__ __device__ __forceinline__ bool get_bit(const BigInt &a, int i) {
-    int word = i / 32;
-    int bit = i % 32;
-    return (a.data[word] >> bit) & 1;
+__host__ __device__ __forceinline__ int get_bit(const BigInt *a, int i) {
+    int word_idx = i >> 5; // i / 32
+    int bit_idx = i & 31;  // i % 32
+    if (word_idx >= BIGINT_WORDS) return 0;
+    return (a->data[word_idx] >> bit_idx) & 1;
 }
 
-//------------------------------------------------------------------------------
-// 辅助函数：简单 256 位加法与减法
-//------------------------------------------------------------------------------
-
-__host__ __device__ inline void ptx_u256Add(BigInt &res, const BigInt &a, const BigInt &b) {
-    uint32_t carry = 0;
-    for (int i = 0; i < 8; i++) {
-         uint64_t sum = (uint64_t)a.data[i] + b.data[i] + carry;
-         res.data[i] = (uint32_t)(sum & 0xFFFFFFFF);
-         carry = (uint32_t)(sum >> 32);
-    }
-}
-
-__host__ __device__ inline void ptx_u256Sub(BigInt &res, const BigInt &a, const BigInt &b) {
-    uint32_t borrow = 0;
-    for (int i = 0; i < 8; i++) {
-         uint64_t ai = a.data[i];
-         uint64_t bi = b.data[i];
-         uint64_t diff = ai - bi - borrow;
-         res.data[i] = (uint32_t)(diff & 0xFFFFFFFF);
-         borrow = (ai < bi + borrow) ? 1 : 0;
-    }
-}
-
-//------------------------------------------------------------------------------
-// 以下为辅助函数，用于辅助实现“特化归约”：
-// 1. 将 256 位 BigInt 乘以一个 32 位常数，结果存入 9 个32位字（低位在前）
-//------------------------------------------------------------------------------
-__host__ __device__ inline void multiply_bigint_by_const(const BigInt &a, uint32_t c, uint32_t result[9]) {
+__host__ __device__ __forceinline__ void ptx_u256Add(BigInt *res, const BigInt *a, const BigInt *b) {
     uint64_t carry = 0;
-    for (int i = 0; i < 8; i++) {
-        uint64_t prod = (uint64_t)a.data[i] * c + carry;
-        result[i] = (uint32_t)(prod & 0xFFFFFFFFUL);
+    for (int i = 0; i < BIGINT_WORDS; ++i) {
+        uint64_t sum = (uint64_t)a->data[i] + b->data[i] + carry;
+        res->data[i] = (uint32_t)sum;
+        carry = (sum >> 32);
+    }
+}
+
+__host__ __device__ __forceinline__ void ptx_u256Sub(BigInt *res, const BigInt *a, const BigInt *b) {
+    uint32_t borrow = 0;
+    for (int i = 0; i < BIGINT_WORDS; ++i) {
+        // 先做 a[i] - borrow
+        uint64_t tmp = (uint64_t)a->data[i] - borrow;
+        // 判断 tmp < b[i] 来决定是否需要再次借位
+        borrow = tmp < b->data[i] ? 1u : 0u;
+        // 真正的差值
+        res->data[i] = (uint32_t)(tmp - b->data[i]);
+    }
+}
+
+// -- 模乘所需的辅助函数 --
+__device__ __forceinline__ void multiply_bigint_by_const(const BigInt *a, uint32_t c, uint32_t result[9]) {
+    uint64_t carry = 0;
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        uint64_t prod = (uint64_t)a->data[i] * c + carry;
+        result[i] = (uint32_t)prod;
         carry = prod >> 32;
     }
     result[8] = (uint32_t)carry;
 }
 
-//------------------------------------------------------------------------------
-// 将 BigInt 左移 32 位（即一个字），结果存入 9 个32位字
-//------------------------------------------------------------------------------
-__host__ __device__ inline void shift_left_word(const BigInt &a, uint32_t result[9]) {
+__device__ __forceinline__ void shift_left_word(const BigInt *a, uint32_t result[9]) {
     result[0] = 0;
-    for (int i = 0; i < 8; i++) {
-        result[i+1] = a.data[i];
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        result[i+1] = a->data[i];
     }
 }
 
-//------------------------------------------------------------------------------
-// 辅助：9字数组加法（共9个32位字，低位在前）
-//------------------------------------------------------------------------------
-__host__ __device__ inline void add_9word(uint32_t r[9], const uint32_t addend[9]) {
+__device__ __forceinline__ void add_9word(uint32_t r[9], const uint32_t addend[9]) {
     uint64_t carry = 0;
     for (int i = 0; i < 9; i++) {
         uint64_t sum = (uint64_t)r[i] + addend[i] + carry;
-        r[i] = (uint32_t)(sum & 0xFFFFFFFFUL);
+        r[i] = (uint32_t)sum;
         carry = sum >> 32;
     }
 }
 
-//------------------------------------------------------------------------------
-// 辅助：将 9字数组（低8字）转回 BigInt
-//------------------------------------------------------------------------------
-__host__ __device__ inline void convert_9word_to_bigint(const uint32_t r[9], BigInt &res) {
-    for (int i = 0; i < 8; i++) {
-        res.data[i] = r[i];
+__device__ __forceinline__ void convert_9word_to_bigint(const uint32_t r[9], BigInt *res) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        res->data[i] = r[i];
     }
 }
 
-//------------------------------------------------------------------------------
-// 修正后的 256 位模乘：
-// 计算 a * b 得到 512 位乘积，然后利用 p = 2^256 - 2^32 - 977 的特殊结构归约：
-//   设  X = L + H*2^256，则有 X ≡ L + H*(2^32+977) (mod p)
-//------------------------------------------------------------------------------
-__host__ __device__ inline void mul_mod(BigInt &res, const BigInt &a, const BigInt &b, const BigInt &p) {
-    // 计算512位乘积，存入16个32位字
-    uint32_t prod[16] = {0};
-    for (int i = 0; i < 16; i++) prod[i] = 0;
-    for (int i = 0; i < 8; i++) {
+// 忠实移植 C 语言版本的 mul_mod_old
+__device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
+    uint32_t prod[2 * BIGINT_WORDS] = {0};
+    for (int i = 0; i < BIGINT_WORDS; i++) {
         uint64_t carry = 0;
-        for (int j = 0; j < 8; j++) {
-            uint64_t tmp = (uint64_t)prod[i+j] + (uint64_t)a.data[i]*b.data[j] + carry;
-            prod[i+j] = (uint32_t)(tmp & 0xFFFFFFFFUL);
+        for (int j = 0; j < BIGINT_WORDS; j++) {
+            uint64_t tmp = (uint64_t)prod[i + j] + (uint64_t)a->data[i] * b->data[j] + carry;
+            prod[i + j] = (uint32_t)tmp;
             carry = tmp >> 32;
         }
-        prod[i+8] += (uint32_t)carry;
+        prod[i + BIGINT_WORDS] += (uint32_t)carry;
     }
-    // 将乘积分为低半部 L 和高半部 H
+    
     BigInt L, H;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
         L.data[i] = prod[i];
-        H.data[i] = prod[i+8];
+        H.data[i] = prod[i + BIGINT_WORDS];
     }
-    // 按照公式：X mod p = L + H*(2^32+977)
+    
     uint32_t Rext[9] = {0};
-    for (int i = 0; i < 8; i++) {
-        Rext[i] = L.data[i];
-    }
+    for (int i = 0; i < BIGINT_WORDS; i++) Rext[i] = L.data[i];
     Rext[8] = 0;
+    
     uint32_t H977[9] = {0};
-    multiply_bigint_by_const(H, 977, H977);
+    multiply_bigint_by_const(&H, 977, H977);
     add_9word(Rext, H977);
+
     uint32_t Hshift[9] = {0};
-    shift_left_word(H, Hshift);
+    shift_left_word(&H, Hshift);
     add_9word(Rext, Hshift);
-    if (Rext[8] != 0) {
+    
+    if (Rext[8]) {
         uint32_t extra[9] = {0};
         BigInt extraBI;
-        init_bigint(extraBI, Rext[8]);
+        init_bigint(&extraBI, Rext[8]);
         Rext[8] = 0;
+        
         uint32_t extra977[9] = {0}, extraShift[9] = {0};
-        multiply_bigint_by_const(extraBI, 977, extra977);
-        shift_left_word(extraBI, extraShift);
-        uint32_t fold[9] = {0};
-        for (int i = 0; i < 9; i++) fold[i] = extra977[i];
-        add_9word(fold, extraShift);
-        add_9word(Rext, fold);
+        multiply_bigint_by_const(&extraBI, 977, extra977);
+        shift_left_word(&extraBI, extraShift);
+        
+        for (int i = 0; i < 9; i++) extra[i] = extra977[i];
+        add_9word(extra, extraShift);
+        add_9word(Rext, extra);
     }
+    
     BigInt R_temp;
-    convert_9word_to_bigint(Rext, R_temp);
-    while ((Rext[8] != 0) || (compare_bigint(R_temp, p) >= 0)) {
-        BigInt temp;
-        ptx_u256Sub(temp, R_temp, p);
-        copy_bigint(R_temp, temp);
-        for (int i = 0; i < 8; i++) Rext[i] = R_temp.data[i];
-        Rext[8] = 0;
+    convert_9word_to_bigint(Rext, &R_temp);
+    
+    // Final subtractions to ensure result < p
+    if (Rext[8] || compare_bigint(&R_temp, &const_p) >= 0) {
+        ptx_u256Sub(&R_temp, &R_temp, &const_p);
     }
-    copy_bigint(res, R_temp);
-}
-
-//------------------------------------------------------------------------------
-// 以下为模归约、模指数、模逆函数（与原代码基本相同）
-//------------------------------------------------------------------------------
-__host__ __device__ __forceinline__ void efficient_mod(BigInt &r, const BigInt &a, const BigInt &p) {
-    copy_bigint(r, a);
-    if (compare_bigint(r, p) >= 0) {
-         BigInt temp;
-         ptx_u256Sub(temp, r, p);
-         if (compare_bigint(temp, p) >= 0)
-              ptx_u256Sub(temp, temp, p);
-         copy_bigint(r, temp);
+    if (compare_bigint(&R_temp, &const_p) >= 0) {
+        ptx_u256Sub(&R_temp, &R_temp, &const_p);
     }
+    
+    copy_bigint(res, &R_temp);
 }
 
-__host__ __device__ __forceinline__ void mod_generic(BigInt &r, const BigInt &a, const BigInt &p) {
-    efficient_mod(r, a, p);
-}
-
-__host__ __device__ __forceinline__ void sub_mod(BigInt &res, const BigInt &a, const BigInt &b, const BigInt &p) {
+// 其他模运算函数
+__device__ __forceinline__ void sub_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
     BigInt temp;
     if (compare_bigint(a, b) < 0) {
          BigInt sum;
-         ptx_u256Add(sum, a, p);
-         ptx_u256Sub(temp, sum, b);
+         ptx_u256Add(&sum, a, &const_p);
+         ptx_u256Sub(&temp, &sum, b);
     } else {
-         ptx_u256Sub(temp, a, b);
+         ptx_u256Sub(&temp, a, b);
     }
-    mod_generic(res, temp, p);
+    copy_bigint(res, &temp);
 }
 
-__host__ __device__ __forceinline__ void add_mod(BigInt &res, const BigInt &a, const BigInt &b, const BigInt &p) {
-    BigInt temp;
-    ptx_u256Add(temp, a, b);
-    mod_generic(res, temp, p);
+// 将 a mod n，结果放到 res（因为 a < 2^256, 所以最多减一次 n 即可）
+__device__ __forceinline__ void scalar_mod_n(BigInt *res, const BigInt *a) {
+    if (compare_bigint(a, &const_n) >= 0) {
+        // a >= n, 做一次减法
+        ptx_u256Sub(res, a, &const_n);
+    } else {
+        copy_bigint(res, a);
+    }
 }
 
-__host__ __device__ __forceinline__ void modexp(BigInt &res, const BigInt &base, const BigInt &exp, const BigInt &p) {
+
+__device__ __forceinline__ void add_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
+    BigInt sum_ab;
+    uint64_t carry = 0;
+    for (int i = 0; i < BIGINT_WORDS; ++i) {
+         uint64_t word_sum = (uint64_t)a->data[i] + b->data[i] + carry;
+         sum_ab.data[i] = (uint32_t)word_sum;
+         carry = word_sum >> 32;
+    }
+    if (carry || compare_bigint(&sum_ab, &const_p) >= 0) {
+        ptx_u256Sub(res, &sum_ab, &const_p);
+    } else {
+        copy_bigint(res, &sum_ab);
+    }
+}
+
+__device__ void modexp(BigInt *res, const BigInt *base, const BigInt *exp) {
     BigInt result;
-    init_bigint(result, 1);
+    init_bigint(&result, 1);
     BigInt b;
-    copy_bigint(b, base);
+    copy_bigint(&b, base);
     for (int i = 0; i < 256; i++) {
          if (get_bit(exp, i)) {
-              BigInt temp;
-              mul_mod(temp, result, b, p);
-              copy_bigint(result, temp);
+              mul_mod_device(&result, &result, &b);
          }
-         BigInt temp;
-         mul_mod(temp, b, b, p);
-         copy_bigint(b, temp);
+         mul_mod_device(&b, &b, &b);
     }
-    copy_bigint(res, result);
+    copy_bigint(res, &result);
 }
 
-__host__ __device__ __forceinline__ void mod_inverse(BigInt &res, const BigInt &a, const BigInt &p) {
-    BigInt p_minus_2;
-    copy_bigint(p_minus_2, p);
-    BigInt two;
-    init_bigint(two, 2);
-    BigInt temp;
-    ptx_u256Sub(temp, p_minus_2, two);
-    copy_bigint(p_minus_2, temp);
-    modexp(res, a, p_minus_2, p);
+__device__ void mod_inverse(BigInt *res, const BigInt *a) {
+    BigInt p_minus_2, two;
+    init_bigint(&two, 2);
+    ptx_u256Sub(&p_minus_2, &const_p, &two);
+    modexp(res, a, &p_minus_2);
 }
 
-//------------------------------------------------------------------------------
-// ECC 运算：点复制、设置无穷远、点加、点加倍
-//------------------------------------------------------------------------------
-__host__ __device__ __forceinline__ void point_set_infinity(ECPoint &P) {
-    P.infinity = true;
+
+
+// --- 雅可比坐标点运算 (Device 版本) ---
+__device__ __forceinline__ void point_set_infinity_jac(ECPointJac *P) {
+    P->infinity = true;
 }
 
-__host__ __device__ __forceinline__ void point_copy(ECPoint &dest, const ECPoint &src) {
-    copy_bigint(dest.x, src.x);
-    copy_bigint(dest.y, src.y);
-    dest.infinity = src.infinity;
+__device__ __forceinline__ void point_copy_jac(ECPointJac *dest, const ECPointJac *src) {
+    copy_bigint(&dest->X, &src->X);
+    copy_bigint(&dest->Y, &src->Y);
+    copy_bigint(&dest->Z, &src->Z);
+    dest->infinity = src->infinity;
 }
 
-__device__ __forceinline__ void point_add(ECPoint &R, const ECPoint &P, const ECPoint &Q, const BigInt &p) {
-    if (P.infinity) { point_copy(R, Q); return; }
-    if (Q.infinity) { point_copy(R, P); return; }
-    BigInt diffY, diffX, inv_diffX, lambda, lambda2, temp;
-    sub_mod(diffY, Q.y, P.y, p);
-    sub_mod(diffX, Q.x, P.x, p);
-    mod_inverse(inv_diffX, diffX, p);
-    mul_mod(lambda, diffY, inv_diffX, p);
-    mul_mod(lambda2, lambda, lambda, p);
-    sub_mod(temp, lambda2, P.x, p);
-    sub_mod(R.x, temp, Q.x, p);
-    sub_mod(temp, P.x, R.x, p);
-    mul_mod(R.y, lambda, temp, p);
-    sub_mod(R.y, R.y, P.y, p);
-    R.infinity = false;
-}
+__device__ void double_point_jac(ECPointJac *R, const ECPointJac *P); // 声明
+__device__ void add_point_jac(ECPointJac *R, const ECPointJac *P, const ECPointJac *Q); // 声明
 
-__device__ __forceinline__ void double_point(ECPoint &R, const ECPoint &P, const BigInt &p) {
-    if (P.infinity || is_zero(P.y)) {
-         point_set_infinity(R);
-         return;
+__device__ void double_point_jac(ECPointJac *R, const ECPointJac *P) {
+    if (P->infinity || is_zero(&P->Y)) {
+        point_set_infinity_jac(R);
+        return;
     }
-    BigInt x2, numerator, denominator, inv_den, lambda, lambda2, two, two_x;
-    mul_mod(x2, P.x, P.x, p);
-    BigInt three; init_bigint(three, 3);
-    mul_mod(numerator, three, x2, p);
-    init_bigint(two, 2);
-    mul_mod(denominator, two, P.y, p);
-    mod_inverse(inv_den, denominator, p);
-    mul_mod(lambda, numerator, inv_den, p);
-    mul_mod(lambda2, lambda, lambda, p);
-    mul_mod(two_x, two, P.x, p);
-    sub_mod(R.x, lambda2, two_x, p);
-    sub_mod(numerator, P.x, R.x, p);
-    mul_mod(R.y, lambda, numerator, p);
-    sub_mod(R.y, R.y, P.y, p);
-    R.infinity = false;
+    BigInt A, B, C, D, X3, Y3, Z3, temp, temp2;
+    mul_mod_device(&A, &P->Y, &P->Y);
+    mul_mod_device(&temp, &P->X, &A);
+    init_bigint(&temp2, 4);
+    mul_mod_device(&B, &temp, &temp2);
+    mul_mod_device(&temp, &A, &A);
+    init_bigint(&temp2, 8);
+    mul_mod_device(&C, &temp, &temp2);
+    mul_mod_device(&temp, &P->X, &P->X);
+    init_bigint(&temp2, 3);
+    mul_mod_device(&D, &temp, &temp2);
+    BigInt D2, two, twoB;
+    mul_mod_device(&D2, &D, &D);
+    init_bigint(&two, 2);
+    mul_mod_device(&twoB, &B, &two);
+    sub_mod_device(&X3, &D2, &twoB);
+    sub_mod_device(&temp, &B, &X3);
+    mul_mod_device(&temp, &D, &temp);
+    sub_mod_device(&Y3, &temp, &C);
+    init_bigint(&temp, 2);
+    mul_mod_device(&temp, &temp, &P->Y);
+    mul_mod_device(&Z3, &temp, &P->Z);
+    copy_bigint(&R->X, &X3);
+    copy_bigint(&R->Y, &Y3);
+    copy_bigint(&R->Z, &Z3);
+    R->infinity = false;
 }
 
-//------------------------------------------------------------------------------
-// 内核：批量 Montgomery ladder 标量乘法，每个线程计算 Q = d * G
-// 同时利用原子加计数器记录处理的密钥数
-//------------------------------------------------------------------------------
-__global__ void kernel_montgomery_ladder_batch_optimized(const BigInt *d_keys, 
-                                                         const ECPoint G, 
-                                                         const BigInt p, 
-                                                         ECPoint *Q_keys, 
-                                                         int n,
-                                                         unsigned long long *d_processedCounter)
-{
-    extern __shared__ ECPoint sG[];
-    if (threadIdx.x == 0) {
-         sG[0] = G;
+__device__ void add_point_jac(ECPointJac *R, const ECPointJac *P, const ECPointJac *Q) {
+    if (P->infinity) { point_copy_jac(R, Q); return; }
+    if (Q->infinity) { point_copy_jac(R, P); return; }
+
+    BigInt Z1Z1, Z2Z2, U1, U2, S1, S2, H, R_big, H2, H3, U1H2, X3, Y3, Z3, temp;
+    mul_mod_device(&Z1Z1, &P->Z, &P->Z);
+    mul_mod_device(&Z2Z2, &Q->Z, &Q->Z);
+    mul_mod_device(&U1, &P->X, &Z2Z2);
+    mul_mod_device(&U2, &Q->X, &Z1Z1);
+    BigInt Z2_cubed, Z1_cubed;
+    mul_mod_device(&temp, &Z2Z2, &Q->Z); copy_bigint(&Z2_cubed, &temp);
+    mul_mod_device(&temp, &Z1Z1, &P->Z); copy_bigint(&Z1_cubed, &temp);
+    mul_mod_device(&S1, &P->Y, &Z2_cubed);
+    mul_mod_device(&S2, &Q->Y, &Z1_cubed);
+
+    if (compare_bigint(&U1, &U2) == 0) {
+        if (compare_bigint(&S1, &S2) != 0) {
+            point_set_infinity_jac(R);
+            return;
+        } else {
+            double_point_jac(R, P);
+            return;
+        }
     }
-    __syncthreads();
+    sub_mod_device(&H, &U2, &U1);
+    sub_mod_device(&R_big, &S2, &S1);
+    mul_mod_device(&H2, &H, &H);
+    mul_mod_device(&H3, &H2, &H);
+    mul_mod_device(&U1H2, &U1, &H2);
+    BigInt R2, two, twoU1H2;
+    mul_mod_device(&R2, &R_big, &R_big);
+    init_bigint(&two, 2);
+    mul_mod_device(&twoU1H2, &U1H2, &two);
+    sub_mod_device(&temp, &R2, &H3);
+    sub_mod_device(&X3, &temp, &twoU1H2);
+    sub_mod_device(&temp, &U1H2, &X3);
+    mul_mod_device(&temp, &R_big, &temp);
+    mul_mod_device(&Y3, &S1, &H3);
+    sub_mod_device(&Y3, &temp, &Y3);
+    mul_mod_device(&temp, &P->Z, &Q->Z);
+    mul_mod_device(&Z3, &temp, &H);
+    copy_bigint(&R->X, &X3);
+    copy_bigint(&R->Y, &Y3);
+    copy_bigint(&R->Z, &Z3);
+    R->infinity = false;
+}
+
+__device__ void jacobian_to_affine(ECPoint *R, const ECPointJac *P) {
+    if (P->infinity) {
+        // 标记为无穷远点，并把坐标全部置零
+        R->infinity = true;
+        init_bigint(&R->x, 0);
+        init_bigint(&R->y, 0);
+        return;
+    }
+    BigInt Zinv, Zinv2, Zinv3;
+    mod_inverse(&Zinv, &P->Z);
+    mul_mod_device(&Zinv2, &Zinv, &Zinv);
+    mul_mod_device(&Zinv3, &Zinv2, &Zinv);
+    mul_mod_device(&R->x, &P->X, &Zinv2);
+    mul_mod_device(&R->y, &P->Y, &Zinv3);
+    R->infinity = false;
+}
+
+
+// --- 核心Device函数: 标量乘法 ---
+__device__ void scalar_multiply_jac_device(ECPointJac *result, const ECPointJac *point, const BigInt *scalar) {
+    ECPointJac res;
+    point_set_infinity_jac(&res);
+
+    int highest_bit = BIGINT_WORDS * 32 - 1;
+    for (; highest_bit >= 0; highest_bit--) {
+        if (get_bit(scalar, highest_bit)) break;
+    }
+
+    if (highest_bit < 0) {
+        point_copy_jac(result, &res);
+        return;
+    }
+
+    ECPointJac p_copy;
+    point_copy_jac(&p_copy, point);
     
+    for (int i = highest_bit; i >= 0; i--) {
+        double_point_jac(&res, &res);
+        if (get_bit(scalar, i)) {
+            add_point_jac(&res, &res, &p_copy);
+        }
+    }
+    point_copy_jac(result, &res);
+}
+
+// ============================================================================
+// 4. CUDA Kernel
+// ============================================================================
+__global__ void private_to_public_key_batch_kernel(
+    const BigInt *d_private_keys,
+    ECPoint *d_public_keys,
+    int num_keys) 
+{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-         BigInt d;
-         copy_bigint(d, d_keys[idx]);
-         ECPoint R0, R1, Q;
-         point_set_infinity(R0);
-         point_copy(R1, sG[0]);
-         for (int i = 255; i >= 0; i--) {
-              if (get_bit(d, i)) {
-                   ECPoint temp;
-                   point_add(temp, R0, R1, p);
-                   point_copy(R0, temp);
-                   ECPoint temp2;
-                   double_point(temp2, R1, p);
-                   point_copy(R1, temp2);
-              } else {
-                   ECPoint temp;
-                   point_add(temp, R0, R1, p);
-                   point_copy(R1, temp);
-                   ECPoint temp2;
-                   double_point(temp2, R0, p);
-                   point_copy(R0, temp2);
-              }
-         }
-         point_copy(Q, R0);
-         Q_keys[idx] = Q;
-         
-         // 计数：每处理一个密钥进行一次原子累加
-         atomicAdd(d_processedCounter, 1ULL);
-    }
-}
+    if (idx >= num_keys) return;
 
-//------------------------------------------------------------------------------
-// 以下为字节序转换相关辅助函数
-//------------------------------------------------------------------------------
-__host__ __device__ inline unsigned int swap_uint32(unsigned int x) {
-    return ((x & 0x000000FFU) << 24) |
-           ((x & 0x0000FF00U) << 8)  |
-           ((x & 0x00FF0000U) >> 8)  |
-           ((x & 0xFF000000U) >> 24);
-}
+    // 1. 先读取并做 mod n
+    BigInt priv;
+    copy_bigint(&priv, &d_private_keys[idx]);
+    scalar_mod_n(&priv, &priv);
 
-__host__ __device__ inline void toBigEndianWords(const BigInt &in, unsigned int out[8]) {
-    for (int i = 0; i < 8; i++) {
-         out[i] = in.data[7 - i];
-    }
+    // 2. 标量乘: Q = priv * G
+    ECPointJac result_jac;
+    scalar_multiply_jac_device(&result_jac, &const_G_jacobian, &priv);
+
+    // 3. 转换坐标
+    ECPoint public_key;
+    jacobian_to_affine(&public_key, &result_jac);
+
+    // 4. 写回
+    d_public_keys[idx] = public_key;
 }
 
 #endif // SECP256K1_CUH
-
